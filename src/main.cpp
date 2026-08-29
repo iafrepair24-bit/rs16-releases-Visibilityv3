@@ -158,6 +158,12 @@ void drawStatusBar();
 void drawSatBar();
 void buzz(uint16_t freq, uint16_t ms);
 float haversine(double lat1, double lon1, double lat2, double lon2);
+void playStartupJingle();
+void drawOpeningAnimation();
+void animTypeText(int x, int y, const char* text, uint16_t color, uint8_t size, uint16_t delayMs);
+void animLoadBar(int x, int y, int w, int h, uint16_t color, uint16_t ms);
+void animGpsWave(int cx, int cy, uint16_t color);
+void animStatusLine(int y, const char* label, bool ok);
 
 // ─── SETUP ───────────────────────────────────────────────────────────────────
 void setup() {
@@ -183,21 +189,11 @@ void setup() {
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(C_WHITE, C_BG);
 
-    // Splash
-    tft.setFreeFont(NULL);
-    tft.setTextSize(2);
-    tft.setCursor(20, 100);
-    tft.setTextColor(C_ACCENT);
-    tft.println("  RS16 GPS LOGGER");
-    tft.setTextSize(1);
-    tft.setTextColor(C_LGREY);
-    tft.setCursor(55, 130);
-    tft.println("Qstarz-style v3");
-    delay(1200);
+    // ── Opening Animation ────────────────────────────────────
+    drawOpeningAnimation();
 
     // GPS
     gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    // Send u-blox UBX-CFG-PRT to ensure NMEA on UART
     // Set 25 Hz update rate via UBX-CFG-RATE (40 ms)
     static const uint8_t ubx_rate_25hz[] = {
         0xB5,0x62,0x06,0x08,0x06,0x00,
@@ -208,25 +204,36 @@ void setup() {
     };
     gpsSerial.write(ubx_rate_25hz, sizeof(ubx_rate_25hz));
     delay(100);
+    animStatusLine(242, "GPS  MG-902", true);
+    delay(300);
 
     // IMU
     Wire.begin(IMU_SDA, IMU_SCL);
-    if (!mpu.begin(0x68, &Wire)) {
+    bool imuOk = mpu.begin(0x68, &Wire);
+    if (!imuOk) {
         Serial.println("MPU6050 not found!");
     } else {
         mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
         mpu.setGyroRange(MPU6050_RANGE_500_DEG);
         mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);
     }
+    animStatusLine(256, "IMU  MPU6050", imuOk);
+    delay(300);
 
     // SPIFFS
-    if (!SPIFFS.begin(true)) {
+    bool spiffsOk = SPIFFS.begin(true);
+    if (!spiffsOk) {
         Serial.println("SPIFFS mount failed");
     } else {
         SPIFFS.mkdir(LOG_DIR);
     }
+    animStatusLine(270, "SPIFFS", spiffsOk);
+    delay(300);
 
-    buzz(2000, 80);
+    // Final bar fill + jingle
+    animLoadBar(20, 290, 200, 8, C_ACCENT, 500);
+    playStartupJingle();
+
     tft.fillScreen(C_BG);
     screenDirty = true;
 }
