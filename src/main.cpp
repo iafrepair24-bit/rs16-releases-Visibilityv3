@@ -73,7 +73,7 @@ Adafruit_MPU6050 mpu;
 HardwareSerial gpsSerial(2);
 
 // ─── SCREEN PAGES ────────────────────────────────────────────────────────────
-enum Screen { SCR_HOME, SCR_TRACK, SCR_STATS, SCR_GRAPH, SCR_DRAG, SCR_CDRAG, SCR_FILES, SCR_COUNT };
+enum Screen { SCR_HOME, SCR_TRACK, SCR_STATS, SCR_GRAPH, SCR_DRAG, SCR_CDRAG, SCR_FILES, SCR_SETTINGS, SCR_COUNT };
 Screen currentScreen = SCR_HOME;
 
 // ─── BUTTON STATE ────────────────────────────────────────────────────────────
@@ -145,6 +145,52 @@ uint32_t lastImuMs = 0;
 uint32_t lastRedrawMs = 0;
 bool screenDirty = true;
 
+// ─── GLOBAL SETTINGS ─────────────────────────────────────────────────────────
+bool  useKmh       = true;        // true=km/h, false=mph
+uint8_t blBright   = 200;         // backlight 0-255
+float odoTotalKm   = 0.0f;        // cumulative odometer all sessions
+#define ODO_FILE   "/odo.dat"
+#define SETTINGS_FILE "/settings.dat"
+
+// Helper: convert speed for display
+float dispSpeed(float kmh)  { return useKmh ? kmh  : kmh * 0.621371f; }
+float dispDist(float km)    { return useKmh ? km   : km  * 0.621371f; }
+const char* speedUnit()     { return useKmh ? "km/h" : "mph"; }
+const char* distUnit()      { return useKmh ? "km"   : "mi";  }
+
+void saveSettings() {
+    File f = SPIFFS.open(SETTINGS_FILE, FILE_WRITE);
+    if (!f) return;
+    f.write((uint8_t*)&useKmh,    sizeof(useKmh));
+    f.write((uint8_t*)&blBright,  sizeof(blBright));
+    f.write((uint8_t*)&odoTotalKm,sizeof(odoTotalKm));
+    f.close();
+}
+void loadSettings() {
+    File f = SPIFFS.open(SETTINGS_FILE, FILE_READ);
+    if (!f) return;
+    f.read((uint8_t*)&useKmh,     sizeof(useKmh));
+    f.read((uint8_t*)&blBright,   sizeof(blBright));
+    f.read((uint8_t*)&odoTotalKm, sizeof(odoTotalKm));
+    f.close();
+}
+
+// ─── KALMAN FILTER (GPS speed) ────────────────────────────────────────────────
+struct KalmanFilter {
+    float q = 0.04f;   // process noise (user-specified)
+    float r = 1.0f;    // measurement noise
+    float x = 0.0f;    // estimate
+    float p = 1.0f;    // error covariance
+    float update(float z) {
+        p = p + q;
+        float k = p / (p + r);
+        x = x + k * (z - x);
+        p = (1.0f - k) * p;
+        return x;
+    }
+};
+KalmanFilter kfSpeed;
+
 // ─── GRAPH RING BUFFERS (200 samples each) ───────────────────────────────────
 #define GBUF_LEN  200
 struct GraphBuf {
@@ -164,6 +210,12 @@ struct GraphBuf {
 };
 GraphBuf gbSpeed, gbGforce, gbPitch, gbRoll;
 uint32_t lastGraphMs = 0;          // sample rate ~50 ms
+
+// ─── SETTINGS STATE ──────────────────────────────────────────────────────────
+// Rows: 0=Unit, 1=Backlight, 2=Odometer, 3=Save&Exit
+#define SETTINGS_ROWS 4
+int  settingsCurRow = 0;
+bool settingsEditing = false;
 
 // ─── DRAG RACE STATE MACHINE ─────────────────────────────────────────────────
 enum DragState {
@@ -314,6 +366,7 @@ void drawStats();
 void drawGraph();
 void drawDrag();
 void drawFiles();
+void drawSettings();
 void drawStatusBar();
 void drawSatBar();
 void drawMiniGraph(int x, int y, int w, int h, GraphBuf &gb, uint16_t col,
@@ -325,7 +378,6 @@ void playStartupJingle();
 void drawOpeningAnimation();
 void animTypeText(int x, int y, const char* text, uint16_t color, uint8_t size, uint16_t delayMs);
 void animLoadBar(int x, int y, int w, int h, uint16_t color, uint16_t ms);
-void animGpsWave(int cx, int cy, uint16_t color);
 void animStatusLine(int y, const char* label, bool ok);
 
 // ─── SETUP ───────────────────────────────────────────────────────────────────
@@ -394,9 +446,13 @@ void setup() {
         Serial.println("SPIFFS mount failed");
     } else {
         SPIFFS.mkdir(LOG_DIR);
+        loadSettings();                    // load unit, backlight, odometer
     }
     animStatusLine(270, "SPIFFS", spiffsOk);
     delay(300);
+
+    // Apply loaded backlight brightness
+    analogWrite(TFT_BL_PIN, blBright);
 
     // Final bar fill + jingle
     animLoadBar(20, 290, 200, 8, C_ACCENT, 500);
@@ -534,6 +590,39 @@ void loop() {
         return;   // skip generic navigation below
     }
 
+    // ── SCR_SETTINGS has its own button handler ───────────────────────────
+    if (currentScreen == SCR_SETTINGS) {
+        if (!settingsEditing) {
+            if (btnUp)   { settingsCurRow = (settingsCurRow + SETTINGS_ROWS - 1) % SETTINGS_ROWS; buzz(1500,25); }
+            if (btnDown) { settingsCurRow = (settingsCurRow + 1) % SETTINGS_ROWS;                 buzz(1500,25); }
+            if (btnSelect) {
+                if (settingsCurRow == 0) {
+                    useKmh = !useKmh;   buzz(2000,40);
+                } else if (settingsCurRow == 1) {
+                    settingsEditing = true; buzz(2000,40);
+                } else if (settingsCurRow == 2) {
+                    odoTotalKm = 0; saveSettings(); buzz(2500,80); delay(80); buzz(2500,80);
+                } else if (settingsCurRow == 3) {
+                    saveSettings();
+                    currentScreen = SCR_HOME;
+                    screenDirty = true;
+                    buzz(2000,60);
+                }
+            }
+            if (btnBack) {
+                saveSettings();
+                currentScreen = SCR_HOME;
+                screenDirty = true;
+            }
+        } else {
+            // Editing backlight
+            if (btnUp)   { blBright = (uint8_t)min(255, (int)blBright + 15); analogWrite(TFT_BL_PIN, blBright); buzz(1800,20); }
+            if (btnDown) { blBright = (uint8_t)max(10,  (int)blBright - 15); analogWrite(TFT_BL_PIN, blBright); buzz(1800,20); }
+            if (btnSelect || btnBack) { settingsEditing = false; buzz(2000,40); }
+        }
+        return;
+    }
+
     // ── Generic navigation for all other screens ──────────────────────────
     if (btnUp) {
         currentScreen = (Screen)((currentScreen + SCR_COUNT - 1) % SCR_COUNT);
@@ -594,7 +683,7 @@ void processGps() {
         gd.fix_age = gps.location.age();
     }
     if (gps.altitude.isUpdated())  gd.alt       = gps.altitude.meters();
-    if (gps.speed.isUpdated())     gd.speed_kmh = gps.speed.kmph();
+    if (gps.speed.isUpdated())     gd.speed_kmh = kfSpeed.update(gps.speed.kmph());
     if (gps.course.isUpdated())    gd.course    = gps.course.deg();
     if (gps.satellites.isUpdated()) gd.sats     = gps.satellites.value();
     if (gps.hdop.isUpdated())      gd.hdop      = gps.hdop.hdop();
@@ -721,6 +810,9 @@ void stopRecording() {
         logFile.flush();
         logFile.close();
     }
+    // Add session distance to cumulative odometer and save
+    odoTotalKm += (float)gd.dist_km;
+    saveSettings();
     buzz(1000, 150); delay(100); buzz(800, 150);
     screenDirty = true;
     Serial.println("Recording stopped. Points: " + String(logCount));
@@ -835,13 +927,13 @@ void drawHome() {
 
     // Big speed
     char spd[8];
-    snprintf(spd, sizeof(spd), "%.0f", gd.speed_kmh);
+    snprintf(spd, sizeof(spd), "%.0f", dispSpeed(gd.speed_kmh));
     tft.setTextSize(6);
     tft.setTextColor(C_ACCENT, C_BG);
     tft.drawString(spd, 120, 75);
     tft.setTextSize(2);
     tft.setTextColor(C_LGREY, C_BG);
-    tft.drawString("km/h", 120, 118);
+    tft.drawString(speedUnit(), 120, 118);
 
     // Horizontal divider
     tft.drawFastHLine(10, 132, 220, C_DGREY);
@@ -854,14 +946,14 @@ void drawHome() {
     tft.setTextSize(2);
     tft.setTextColor(C_WHITE, C_BG);
     char buf[20];
-    snprintf(buf, sizeof(buf), "%.0f", gd.speed_max);
+    snprintf(buf, sizeof(buf), "%.0f", dispSpeed(gd.speed_max));
     tft.drawString(buf, 60, 165);
-    snprintf(buf, sizeof(buf), "%.2f", gd.dist_km);
+    snprintf(buf, sizeof(buf), "%.2f", dispDist((float)gd.dist_km));
     tft.drawString(buf, 180, 165);
     tft.setTextSize(1);
     tft.setTextColor(C_DGREY, C_BG);
-    tft.drawString("km/h", 60, 180);
-    tft.drawString("km", 180, 180);
+    tft.drawString(speedUnit(), 60, 180);
+    tft.drawString(distUnit(), 180, 180);
 
     // Row 2: Elapsed | Avg speed
     tft.drawFastHLine(10, 192, 220, C_DGREY);
@@ -873,11 +965,11 @@ void drawHome() {
     uint32_t s = gd.elapsed_s;
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60);
     tft.drawString(buf, 90, 225);
-    snprintf(buf, sizeof(buf), "%.0f", gd.avg_speed);
+    snprintf(buf, sizeof(buf), "%.0f", dispSpeed(gd.avg_speed));
     tft.drawString(buf, 185, 225);
     tft.setTextSize(1);
     tft.setTextColor(C_DGREY, C_BG);
-    tft.drawString("km/h", 185, 238);
+    tft.drawString(speedUnit(), 185, 238);
 
     // Row 3: Heading compass + fix
     tft.drawFastHLine(10, 248, 220, C_DGREY);
@@ -945,9 +1037,9 @@ void drawTrack() {
     tft.setTextColor(C_WHITE, C_BG);
     tft.setTextDatum(TL_DATUM);
     char buf[40];
-    snprintf(buf, sizeof(buf), "Dist: %.2f km  Pts: %lu", gd.dist_km, logCount);
+    snprintf(buf, sizeof(buf), "Dist: %.2f %s  Pts: %lu", dispDist((float)gd.dist_km), distUnit(), logCount);
     tft.drawString(buf, 8, 254);
-    snprintf(buf, sizeof(buf), "Spd: %.0f km/h  Max: %.0f km/h", gd.speed_kmh, gd.speed_max);
+    snprintf(buf, sizeof(buf), "Spd: %.0f  Max: %.0f %s", dispSpeed(gd.speed_kmh), dispSpeed(gd.speed_max), speedUnit());
     tft.drawString(buf, 8, 268);
 
     tft.setTextColor(C_DGREY, C_BG);
@@ -984,13 +1076,13 @@ void drawStats() {
     row(60,  "Start Time",  gd.timeStr);
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60);
     row(72,  "Duration",    buf);
-    snprintf(buf, sizeof(buf), "%.3f km", gd.dist_km);
+    snprintf(buf, sizeof(buf), "%.3f %s", dispDist((float)gd.dist_km), distUnit());
     row(84,  "Distance",    buf);
-    snprintf(buf, sizeof(buf), "%.1f km/h", gd.speed_kmh);
+    snprintf(buf, sizeof(buf), "%.1f %s", dispSpeed(gd.speed_kmh), speedUnit());
     row(96,  "Speed",       buf, gd.speed_kmh > 50 ? C_WARN : C_WHITE);
-    snprintf(buf, sizeof(buf), "%.1f km/h", gd.speed_max);
+    snprintf(buf, sizeof(buf), "%.1f %s", dispSpeed(gd.speed_max), speedUnit());
     row(108, "Max Speed",   buf, C_ACCENT);
-    snprintf(buf, sizeof(buf), "%.1f km/h", gd.avg_speed);
+    snprintf(buf, sizeof(buf), "%.1f %s", dispSpeed(gd.avg_speed), speedUnit());
     row(120, "Avg Speed",   buf);
     snprintf(buf, sizeof(buf), "%.1f m", gd.alt);
     row(132, "Altitude",    buf);
@@ -1006,8 +1098,8 @@ void drawStats() {
     row(192, "Accel",       buf, imuData.accel_g > 1.3f ? C_WARN : C_WHITE);
     snprintf(buf, sizeof(buf), "%.2f V (%d%%)", batVoltage, batPercent);
     row(204, "Battery",     buf, batPercent < 20 ? C_RED : C_ACCENT);
-    snprintf(buf, sizeof(buf), "%lu points", logCount);
-    row(216, "Log Points",  buf);
+    snprintf(buf, sizeof(buf), "%.1f %s", dispDist(odoTotalKm + (float)gd.dist_km), distUnit());
+    row(216, "Odometer",    buf, C_LGREY);
     row(228, "File",        recording ? logFileName.c_str() : "---");
 
     tft.drawFastHLine(8, 240, 224, C_DGREY);
@@ -1773,14 +1865,298 @@ void drawDrag() {
 // ─── MAIN DRAW DISPATCHER ────────────────────────────────────────────────────
 void drawScreen() {
     switch (currentScreen) {
-        case SCR_HOME:  drawHome();  break;
-        case SCR_TRACK: drawTrack(); break;
-        case SCR_STATS: drawStats(); break;
-        case SCR_GRAPH: drawGraph(); break;
-        case SCR_DRAG:  drawDrag();  break;
-        case SCR_FILES: drawFiles(); break;
+        case SCR_HOME:     drawHome();     break;
+        case SCR_TRACK:    drawTrack();    break;
+        case SCR_STATS:    drawStats();    break;
+        case SCR_GRAPH:    drawGraph();    break;
+        case SCR_DRAG:     drawDrag();     break;
+        case SCR_CDRAG:    drawCDrag();    break;
+        case SCR_FILES:    drawFiles();    break;
+        case SCR_SETTINGS: drawSettings(); break;
         default: break;
     }
+}
+
+// ─── OPENING ANIMATION ───────────────────────────────────────────────────────
+void animStatusLine(int y, const char* label, bool ok) {
+    tft.setTextSize(1);
+    tft.setTextColor(C_LGREY, C_BG);
+    tft.setCursor(10, y);
+    tft.print(label);
+    tft.setTextColor(ok ? C_ACCENT : C_RED, C_BG);
+    tft.setCursor(170, y);
+    tft.print(ok ? "OK" : "FAIL");
+}
+
+void animLoadBar(int x, int y, int w, int h, uint16_t color, uint16_t ms) {
+    tft.drawRect(x, y, w, h, C_DGREY);
+    uint16_t steps = 30;
+    uint16_t stepDelay = ms / steps;
+    for (uint16_t i = 0; i <= steps; i++) {
+        int fill = (w - 2) * i / steps;
+        tft.fillRect(x+1, y+1, fill, h-2, color);
+        delay(stepDelay);
+    }
+}
+
+void playStartupJingle() {
+    buzz(1047, 80); delay(40);
+    buzz(1319, 80); delay(40);
+    buzz(1568, 80); delay(40);
+    buzz(2093, 160);
+}
+
+void drawOpeningAnimation() {
+    tft.fillScreen(C_BG);
+
+    // ── Fade-in via backlight ──────────────────────────────────────────
+    analogWrite(TFT_BL_PIN, 0);
+
+    // ── Logo: "RS16" large centred ───────────────────────────────────
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(6);
+    tft.setTextColor(C_ACCENT, C_BG);
+    tft.drawString("RS16", 120, 110);
+
+    // Subtitle
+    tft.setTextSize(1);
+    tft.setTextColor(C_LGREY, C_BG);
+    tft.drawString("RACE  SPEED  DATA  LOGGER", 120, 148);
+
+    // Divider lines either side of subtitle
+    tft.drawFastHLine(10, 158, 100, C_DGREY);
+    tft.drawFastHLine(130, 158, 100, C_DGREY);
+
+    // Version tag
+    tft.setTextColor(C_DGREY, C_BG);
+    tft.drawString("v3.0", 120, 168);
+
+    // Fade in
+    for (int b = 0; b <= 220; b += 10) {
+        analogWrite(TFT_BL_PIN, b);
+        delay(18);
+    }
+
+    delay(600);   // hold logo visible
+}
+
+// ─── GRAPH SCREEN ────────────────────────────────────────────────────────────
+
+// Draw one mini scrolling graph panel
+void drawMiniGraph(int x, int y, int w, int h, GraphBuf &gb, uint16_t col,
+                   const char* label, const char* unit, float curVal) {
+    // Background + border
+    tft.fillRect(x, y, w, h, C_BG);
+    tft.drawRect(x, y, w, h, C_DGREY);
+
+    // Label
+    tft.setTextSize(1);
+    tft.setTextColor(C_LGREY, C_BG);
+    tft.setCursor(x+2, y+2);
+    tft.print(label);
+
+    // Current value (right-aligned)
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%.1f%s", curVal, unit);
+    tft.setTextColor(col, C_BG);
+    tft.setCursor(x + w - 48, y+2);
+    tft.print(buf);
+
+    // Determine range (use buffer's tracked min/max, clamp to reasonable)
+    float vmin = gb.vmin;
+    float vmax = gb.vmax;
+    if (vmax - vmin < 0.5f) { vmax = vmin + 1.0f; }
+    float range = vmax - vmin;
+
+    int plotH = h - 16;   // leave top 14px for labels, 2px border
+    int plotY = y + 14;
+    int plotW = w - 2;
+
+    // Draw plot points — sample buffer down to plotW pixels
+    int prev_px = -1, prev_py = -1;
+    for (int px = 0; px < plotW; px++) {
+        int idx = (int)((float)px / plotW * GBUF_LEN);
+        float v = gb.get((uint16_t)idx);
+        int py = plotY + plotH - 1 - (int)((v - vmin) / range * (plotH - 1));
+        py = constrain(py, plotY, plotY + plotH - 1);
+        if (prev_px >= 0) {
+            tft.drawLine(x+1+prev_px, prev_py, x+1+px, py, col);
+        }
+        prev_px = px;
+        prev_py = py;
+    }
+}
+
+// Artificial horizon (attitude indicator)
+void drawArtificialHorizon(int cx, int cy, int r, float pitch, float roll) {
+    // Clip circle region by drawing sky/ground split
+    // We draw a filled circle then overlay the horizon line
+    tft.fillCircle(cx, cy, r, C_SKY);
+
+    // Horizon tilt offset from pitch (pixels, 1° ≈ r/45 px)
+    float pitchPx = pitch * r / 45.0f;
+
+    // Roll: rotate horizon line
+    float sinR = sinf(roll * DEG_TO_RAD);
+    float cosR = cosf(roll * DEG_TO_RAD);
+
+    // Draw ground half as a chord fill — approximate with rectangle + rotation
+    // Simple version: shift horizon line by pitchPx, rotate by roll
+    int x1 = cx - (int)(r * cosR);
+    int y1 = cy + (int)(r * sinR) + (int)pitchPx;
+    int x2 = cx + (int)(r * cosR);
+    int y2 = cy - (int)(r * sinR) + (int)pitchPx;
+
+    // Fill ground colour below horizon line (flood-fill not available — draw many lines)
+    for (int dy = -r; dy <= r; dy++) {
+        // parametric x extent at this y
+        int chord = (int)sqrtf((float)(r*r - dy*dy));
+        int gy = cy + dy;
+        // determine if this scanline is "below" horizon
+        // horizon at gy: solve horizon line equation for x
+        // horizon: from (x1,y1) to (x2,y2)
+        float t = (x2 == x1) ? 0.5f : (float)(gy - y1) / (float)(y2 - y1);
+        // If entire scanline is below horizon line
+        int lineX = (int)(x1 + t * (x2 - x1));
+        if (gy >= min(y1, y2)) {
+            // paint ground
+            int sx = cx - chord, ex = cx + chord;
+            tft.drawFastHLine(sx, gy, ex - sx, C_GROUND);
+        }
+    }
+
+    // Horizon line
+    tft.drawLine(x1, y1, x2, y2, C_WHITE);
+
+    // Clip circle border (redraw outline)
+    tft.drawCircle(cx, cy, r, C_LGREY);
+
+    // Centre dot + pitch/roll lines
+    tft.fillCircle(cx, cy, 3, C_YELLOW);
+    tft.drawFastHLine(cx-10, cy, 8, C_YELLOW);
+    tft.drawFastHLine(cx+3,  cy, 8, C_YELLOW);
+
+    // Roll scale tick at top
+    for (int ang = -30; ang <= 30; ang += 10) {
+        float rad = (ang - 90) * DEG_TO_RAD;
+        int tx = cx + (int)((r-4)*cosf(rad));
+        int ty = cy + (int)((r-4)*sinf(rad));
+        tft.fillCircle(tx, ty, 1, C_WHITE);
+    }
+}
+
+void drawGraph() {
+    tft.fillRect(0, 22, 240, 298, C_BG);
+
+    // ── 4 mini graphs (top half) ─────────────────────────────────────────
+    int gw = 116, gh = 62;
+    drawMiniGraph(2,   24, gw, gh, gbSpeed,  C_ACCENT,  "SPD",  speedUnit(), dispSpeed(gd.speed_kmh));
+    drawMiniGraph(122, 24, gw, gh, gbGforce, C_ORANGE,  "G",    "G",         imuData.accel_g);
+    drawMiniGraph(2,   90, gw, gh, gbPitch,  C_YELLOW,  "PCH",  "°",         imuData.pitch);
+    drawMiniGraph(122, 90, gw, gh, gbRoll,   C_PURPLE,  "ROL",  "°",         imuData.roll);
+
+    // ── Artificial Horizon (bottom half) ─────────────────────────────────
+    tft.drawFastHLine(4, 158, 232, C_DGREY);
+
+    int cx = 120, cy = 235, hr = 68;
+    drawArtificialHorizon(cx, cy, hr, imuData.pitch, imuData.roll);
+
+    // Pitch & Roll readouts
+    tft.setTextSize(1);
+    char buf[16];
+    tft.setTextColor(C_YELLOW, C_BG);
+    tft.setCursor(4, 163);
+    snprintf(buf, sizeof(buf), "PITCH: %.1f°", imuData.pitch);
+    tft.print(buf);
+    tft.setTextColor(C_PURPLE, C_BG);
+    tft.setCursor(130, 163);
+    snprintf(buf, sizeof(buf), "ROLL:  %.1f°", imuData.roll);
+    tft.print(buf);
+
+    // G-force indicator bar
+    tft.setTextColor(C_ORANGE, C_BG);
+    tft.setCursor(4, 175);
+    snprintf(buf, sizeof(buf), "G-FORCE: %.2f", imuData.accel_g);
+    tft.print(buf);
+    int barW = (int)(imuData.accel_g / 3.0f * 160.0f);
+    barW = constrain(barW, 0, 160);
+    tft.fillRect(4,   186, barW, 8, imuData.accel_g > 1.3f ? C_RED : C_ORANGE);
+    tft.drawRect(4,   186, 160,  8, C_DGREY);
+
+    drawStatusBar();
+}
+
+// ─── SETTINGS SCREEN ─────────────────────────────────────────────────────────
+void drawSettings() {
+    tft.fillRect(0, 22, 240, 298, C_BG);
+
+    // Header
+    tft.fillRect(0, 22, 240, 18, 0x1082);
+    tft.setTextColor(C_WHITE, 0x1082);
+    tft.setTextSize(1);
+    tft.setCursor(4, 27);
+    tft.print("SETTINGS");
+
+    auto settRow = [&](int row, const char* label, const char* val, uint16_t vcol) {
+        bool isCur  = (row == settingsCurRow);
+        bool isEdit = (isCur && settingsEditing);
+        uint16_t bg = isCur ? (isEdit ? 0x001F : 0x2104) : C_BG;
+        int ry = 50 + row * 40;
+        tft.fillRect(4, ry, 232, 32, bg);
+        tft.drawRect(4, ry, 232, 32, isCur ? C_ACCENT : C_DGREY);
+        tft.setTextColor(isCur ? C_WHITE : C_LGREY, bg);
+        tft.setTextSize(1);
+        tft.setCursor(10, ry+8);
+        tft.print(label);
+        tft.setTextColor(isEdit ? C_YELLOW : vcol, bg);
+        tft.setTextSize(2);
+        tft.setCursor(130, ry+8);
+        tft.print(val);
+    };
+
+    char buf[20];
+
+    // Row 0: Unit
+    settRow(0, "UNIT SPEED / DIST",
+            useKmh ? "km/h  km" : "mph   mi",
+            useKmh ? C_ACCENT : C_YELLOW);
+
+    // Row 1: Backlight
+    snprintf(buf, sizeof(buf), "%d%%", blBright * 100 / 255);
+    settRow(1, "BACKLIGHT", buf, C_WHITE);
+
+    // Row 2: Odometer
+    snprintf(buf, sizeof(buf), "%.1f %s", dispDist(odoTotalKm), distUnit());
+    settRow(2, "ODO TOTAL  [SEL=RST]", buf, C_LGREY);
+
+    // Row 3: Save & Exit
+    {
+        bool isCur = (3 == settingsCurRow);
+        uint16_t bg = isCur ? 0x3800 : C_BG;
+        int ry = 50 + 3 * 40;
+        tft.fillRect(4, ry, 232, 32, bg);
+        tft.drawRect(4, ry, 232, 32, isCur ? C_YELLOW : C_DGREY);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(isCur ? C_YELLOW : C_DGREY, bg);
+        tft.setTextSize(1);
+        tft.drawString("SAVE & EXIT", 120, ry + 16);
+        tft.setTextDatum(TL_DATUM);
+    }
+
+    // Backlight edit hint
+    if (settingsEditing) {
+        tft.setTextColor(C_YELLOW, C_BG);
+        tft.setTextSize(1);
+        tft.setCursor(4, 218);
+        tft.print("[UP/DOWN] Adjust   [SEL/BCK] Confirm");
+    } else {
+        tft.setTextColor(C_DGREY, C_BG);
+        tft.setTextSize(1);
+        tft.setCursor(4, 218);
+        tft.print("[UP/DOWN] Nav  [SEL] Edit  [BCK] Save");
+    }
+
+    drawStatusBar();
 }
 
 // ─── BUZZER ──────────────────────────────────────────────────────────────────
