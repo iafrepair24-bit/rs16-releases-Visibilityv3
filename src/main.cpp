@@ -226,37 +226,61 @@ static const uint16_t CDRAG_STEPS[] = {
 #define CDRAG_STEP_COUNT  (sizeof(CDRAG_STEPS)/sizeof(CDRAG_STEPS[0]))
 
 enum CDragState {
-    CDRAG_IDLE,    // show setup UI
-    CDRAG_ARMED,   // armed, waiting launch
+    CDRAG_SETUP,   // editing configuration (distances, rollout, interval)
+    CDRAG_IDLE,    // config done, ready to arm
+    CDRAG_ARMED,   // armed, waiting for launch
     CDRAG_RUNNING, // timer running
     CDRAG_DONE     // results display
 };
-CDragState cdragState = CDRAG_IDLE;
+CDragState cdragState = CDRAG_SETUP;
 
 struct CDragSlot {
-    uint16_t distM  = 0;     // target distance in metres (0 = disabled)
-    float    timeS  = 0;     // result time
-    float    speedKmh = 0;   // trap speed at line
-    bool     set    = false; // result recorded
+    uint16_t distM    = 0;     // target distance in metres (0 = disabled)
+    float    timeS    = 0;     // result time
+    float    speedKmh = 0;     // trap speed at line
+    bool     set      = false; // result recorded
 };
 
 struct CDragRun {
     CDragSlot slots[CDRAG_SLOTS];
-    float   reactionTimeS = 0;
-    float   peakG         = 0;
-    uint32_t startMs      = 0;
-    double  distM         = 0;   // cumulative metres
-    double  prevLat       = 0, prevLon = 0;
-    float   cdPreG        = 0;
-    uint32_t armMs        = 0;
+    // ── Setup config ────────────────────────────────────────────────────
+    bool     rolloutEnabled = false;  // rollout compensation on/off
+    float    rolloutM       = 0.3f;   // rollout distance metres (0.1–2.0)
+    bool     intervalMode   = false;  // auto-generate equal-spaced splits
+    uint16_t intervalM      = 100;    // interval spacing metres
+    // ── Run results ─────────────────────────────────────────────────────
+    float    reactionTimeS  = 0;
+    float    peakG          = 0;
+    uint32_t startMs        = 0;
+    double   distM          = 0;      // cumulative metres this run
+    double   prevLat        = 0, prevLon = 0;
+    float    cdPreG         = 0;
+    uint32_t armMs          = 0;
+    double   rolloutAccumM  = 0;      // metres moved since arm (rollout phase)
+    bool     rolloutDone    = false;  // has rollout been satisfied
 };
 CDragRun cdrag;
 
-int  cdragCurSlot  = 0;   // which slot is cursor on in setup UI
-bool cdragEditing  = false; // are we in edit mode for current slot
+// Setup cursor — rows: 0-4 = slots, 5 = rollout on/off, 6 = rollout dist,
+//                        7 = interval on/off, 8 = interval dist, 9 = [ARM]
+#define CDRAG_SETUP_ROWS  10
+int  cdragCurRow   = 0;   // which row is cursor on in setup UI
+bool cdragEditing  = false; // are we editing the value of current row
 
 // Default values on first boot (10,50,100,200,500)
 static const uint16_t CDRAG_DEFAULTS[CDRAG_SLOTS] = {10, 50, 100, 200, 500};
+
+// Rollout step values (metres × 10 stored, displayed as 0.1–2.0)
+static const uint8_t ROLLOUT_STEPS_X10[] = {
+    1,2,3,4,5,6,7,8,9,10,12,15,20   // 0.1…2.0 m
+};
+#define ROLLOUT_STEP_COUNT (sizeof(ROLLOUT_STEPS_X10)/sizeof(ROLLOUT_STEPS_X10[0]))
+
+// Interval step presets (metres)
+static const uint16_t INTERVAL_STEPS[] = {
+    10, 20, 25, 50, 75, 100, 150, 200, 250, 300, 400, 500
+};
+#define INTERVAL_STEP_COUNT (sizeof(INTERVAL_STEPS)/sizeof(INTERVAL_STEPS[0]))
 
 // ─── FORWARD DECLARATIONS ────────────────────────────────────────────────────
 void readButtons();
@@ -275,7 +299,14 @@ void armCDrag();
 void resetCDrag();
 void cdragSlotStepUp(int slot);
 void cdragSlotStepDown(int slot);
+void cdragRolloutStepUp();
+void cdragRolloutStepDown();
+void cdragIntervalStepUp();
+void cdragIntervalStepDown();
+void cdragApplyIntervalMode();
 void drawCDrag();
+void drawCDragSetup();
+void drawCDragRun();
 void drawScreen();
 void drawHome();
 void drawTrack();
@@ -440,39 +471,65 @@ void loop() {
 
     // ── SCR_CDRAG has its own full button handler ─────────────────────────
     if (currentScreen == SCR_CDRAG) {
-        if (cdragState == CDRAG_IDLE) {
+        if (cdragState == CDRAG_SETUP) {
             if (!cdragEditing) {
-                // Navigate slots
-                if (btnUp)   { cdragCurSlot = (cdragCurSlot + CDRAG_SLOTS - 1) % CDRAG_SLOTS; buzz(1500,25); }
-                if (btnDown) { cdragCurSlot = (cdragCurSlot + 1) % CDRAG_SLOTS;               buzz(1500,25); }
-                // SELECT: toggle edit mode on current slot
-                if (btnSelect) { cdragEditing = true; buzz(2000, 40); }
-                // BACK: leave screen
-                if (btnBack) { currentScreen = SCR_HOME; screenDirty = true; }
-                // UP+DOWN long hold not needed — handled below via edit mode
-            } else {
-                // Editing current slot value: UP/DOWN step through presets
-                if (btnUp)   { cdragSlotStepUp(cdragCurSlot);   buzz(1800,25); }
-                if (btnDown) { cdragSlotStepDown(cdragCurSlot); buzz(1800,25); }
-                // SELECT confirms and moves to next slot (or arms if last)
+                // Navigate setup rows
+                if (btnUp)   { cdragCurRow = (cdragCurRow + CDRAG_SETUP_ROWS - 1) % CDRAG_SETUP_ROWS; buzz(1500,25); }
+                if (btnDown) { cdragCurRow = (cdragCurRow + 1) % CDRAG_SETUP_ROWS;                     buzz(1500,25); }
                 if (btnSelect) {
-                    cdragEditing = false;
-                    if (cdragCurSlot < CDRAG_SLOTS - 1) {
-                        cdragCurSlot++;
+                    if (cdragCurRow == CDRAG_SETUP_ROWS - 1) {
+                        // [ARM] row
+                        if (cdrag.intervalMode) cdragApplyIntervalMode();
+                        cdragState = CDRAG_IDLE;
+                        armCDrag();
+                    } else if (cdragCurRow == 5) {
+                        // Rollout on/off toggle
+                        cdrag.rolloutEnabled = !cdrag.rolloutEnabled;
+                        buzz(2000, 40);
+                    } else if (cdragCurRow == 7) {
+                        // Interval mode on/off toggle
+                        cdrag.intervalMode = !cdrag.intervalMode;
                         buzz(2000, 40);
                     } else {
-                        // All slots configured — arm
-                        cdragCurSlot = 0;
-                        armCDrag();
+                        // Enter edit mode for slots (0-4), rollout dist (6), interval dist (8)
+                        cdragEditing = true;
+                        buzz(2000, 40);
                     }
                 }
-                if (btnBack) { cdragEditing = false; buzz(1200, 40); }
+                if (btnBack) { currentScreen = SCR_HOME; screenDirty = true; }
+            } else {
+                // Edit mode — UP/DOWN changes value
+                if (cdragCurRow < CDRAG_SLOTS) {
+                    if (btnUp)   { cdragSlotStepUp(cdragCurRow);   buzz(1800,25); }
+                    if (btnDown) { cdragSlotStepDown(cdragCurRow); buzz(1800,25); }
+                } else if (cdragCurRow == 6) {
+                    if (btnUp)   { cdragRolloutStepUp();   buzz(1800,25); }
+                    if (btnDown) { cdragRolloutStepDown(); buzz(1800,25); }
+                } else if (cdragCurRow == 8) {
+                    if (btnUp)   { cdragIntervalStepUp();   buzz(1800,25); }
+                    if (btnDown) { cdragIntervalStepDown(); buzz(1800,25); }
+                }
+                if (btnSelect) { cdragEditing = false; buzz(2000, 40); }
+                if (btnBack)   { cdragEditing = false; buzz(1200, 40); }
             }
+        } else if (cdragState == CDRAG_IDLE) {
+            // Ready to arm — SELECT = arm, BACK = back to setup
+            if (btnSelect) { armCDrag(); }
+            if (btnBack)   { cdragState = CDRAG_SETUP; screenDirty = true; }
         } else if (cdragState == CDRAG_DONE) {
-            if (btnSelect || btnBack) { resetCDrag(); }
+            // SELECT = back to setup keeping config, BACK same
+            if (btnSelect || btnBack) {
+                resetCDrag();
+                cdragState = CDRAG_SETUP;
+                screenDirty = true;
+            }
         } else {
-            // ARMED or RUNNING: SELECT/BACK = abort
-            if (btnSelect || btnBack) { resetCDrag(); }
+            // ARMED or RUNNING: SELECT/BACK = abort back to setup
+            if (btnSelect || btnBack) {
+                resetCDrag();
+                cdragState = CDRAG_SETUP;
+                screenDirty = true;
+            }
         }
         return;   // skip generic navigation below
     }
@@ -1018,36 +1075,72 @@ void drawFiles() {
 
 // ─── CUSTOM DRAG LOGIC ───────────────────────────────────────────────────────
 
-// Step through preset values UP
+// Step slot distance UP through presets
 void cdragSlotStepUp(int slot) {
     uint16_t cur = cdrag.slots[slot].distM;
-    // Find next preset value above current
     for (int i = 0; i < (int)CDRAG_STEP_COUNT; i++) {
-        if (CDRAG_STEPS[i] > cur) {
-            cdrag.slots[slot].distM = CDRAG_STEPS[i];
-            return;
-        }
+        if (CDRAG_STEPS[i] > cur) { cdrag.slots[slot].distM = CDRAG_STEPS[i]; return; }
     }
-    cdrag.slots[slot].distM = CDRAG_MAX_M;  // wrap to max
+    cdrag.slots[slot].distM = 0;   // wrap: next after max = OFF
 }
-
-// Step through preset values DOWN
+// Step slot distance DOWN through presets
 void cdragSlotStepDown(int slot) {
     uint16_t cur = cdrag.slots[slot].distM;
+    if (cur == 0) { cdrag.slots[slot].distM = CDRAG_MAX_M; return; }
     for (int i = (int)CDRAG_STEP_COUNT - 1; i >= 0; i--) {
-        if (CDRAG_STEPS[i] < cur) {
-            cdrag.slots[slot].distM = CDRAG_STEPS[i];
-            return;
+        if (CDRAG_STEPS[i] < cur) { cdrag.slots[slot].distM = CDRAG_STEPS[i]; return; }
+    }
+    cdrag.slots[slot].distM = 0;   // wrap to OFF
+}
+
+// Step rollout distance UP (0.1 m increments via lookup)
+void cdragRolloutStepUp() {
+    uint8_t curX10 = (uint8_t)roundf(cdrag.rolloutM * 10.0f);
+    for (int i = 0; i < (int)ROLLOUT_STEP_COUNT; i++) {
+        if (ROLLOUT_STEPS_X10[i] > curX10) {
+            cdrag.rolloutM = ROLLOUT_STEPS_X10[i] / 10.0f; return;
         }
     }
-    cdrag.slots[slot].distM = CDRAG_MIN_M;  // wrap to min
+    cdrag.rolloutM = ROLLOUT_STEPS_X10[ROLLOUT_STEP_COUNT-1] / 10.0f;
+}
+void cdragRolloutStepDown() {
+    uint8_t curX10 = (uint8_t)roundf(cdrag.rolloutM * 10.0f);
+    for (int i = (int)ROLLOUT_STEP_COUNT - 1; i >= 0; i--) {
+        if (ROLLOUT_STEPS_X10[i] < curX10) {
+            cdrag.rolloutM = ROLLOUT_STEPS_X10[i] / 10.0f; return;
+        }
+    }
+    cdrag.rolloutM = ROLLOUT_STEPS_X10[0] / 10.0f;
+}
+
+// Step interval distance UP/DOWN
+void cdragIntervalStepUp() {
+    uint16_t cur = cdrag.intervalM;
+    for (int i = 0; i < (int)INTERVAL_STEP_COUNT; i++) {
+        if (INTERVAL_STEPS[i] > cur) { cdrag.intervalM = INTERVAL_STEPS[i]; return; }
+    }
+    cdrag.intervalM = INTERVAL_STEPS[INTERVAL_STEP_COUNT-1];
+}
+void cdragIntervalStepDown() {
+    uint16_t cur = cdrag.intervalM;
+    for (int i = (int)INTERVAL_STEP_COUNT - 1; i >= 0; i--) {
+        if (INTERVAL_STEPS[i] < cur) { cdrag.intervalM = INTERVAL_STEPS[i]; return; }
+    }
+    cdrag.intervalM = INTERVAL_STEPS[0];
+}
+
+// Auto-fill 5 slots with equal intervals up to 5× intervalM
+void cdragApplyIntervalMode() {
+    for (int i = 0; i < CDRAG_SLOTS; i++) {
+        uint32_t d = (uint32_t)(i + 1) * cdrag.intervalM;
+        cdrag.slots[i].distM = (d <= CDRAG_MAX_M) ? (uint16_t)d : 0;
+    }
 }
 
 void resetCDrag() {
-    cdragState   = CDRAG_IDLE;
-    cdragEditing = false;
-    cdragCurSlot = 0;
-    // Preserve distM targets, only clear results
+    // Preserve all config (slots distM, rollout, interval); clear only results
+    cdragEditing    = false;
+    cdragCurRow     = 0;
     for (int i = 0; i < CDRAG_SLOTS; i++) {
         cdrag.slots[i].timeS    = 0;
         cdrag.slots[i].speedKmh = 0;
@@ -1056,6 +1149,8 @@ void resetCDrag() {
     cdrag.reactionTimeS = 0;
     cdrag.peakG         = 0;
     cdrag.distM         = 0;
+    cdrag.rolloutAccumM = 0;
+    cdrag.rolloutDone   = false;
     screenDirty = true;
 }
 
@@ -1073,19 +1168,21 @@ void updateCDrag() {
     float spd = gd.speed_kmh;
     float g   = imuData.accel_g;
 
-    // ── ARMED: detect launch ─────────────────────────────────────────────
+    // ── ARMED: detect launch (G-force or speed) ──────────────────────────
     if (cdragState == CDRAG_ARMED) {
         if (spd < DRAG_LAUNCH_KMH && g > cdrag.cdPreG) cdrag.cdPreG = g;
         bool gLaunch   = (g > cdrag.cdPreG + DRAG_LAUNCH_G) && (g > 0.4f);
         bool spdLaunch = (spd >= DRAG_LAUNCH_KMH);
         if (gLaunch || spdLaunch) {
-            cdragState            = CDRAG_RUNNING;
-            cdrag.startMs         = millis();
-            cdrag.prevLat         = gd.lat;
-            cdrag.prevLon         = gd.lon;
-            cdrag.distM           = 0;
-            cdrag.peakG           = g;
-            cdrag.reactionTimeS   = (cdrag.startMs - cdrag.armMs) / 1000.0f;
+            cdragState          = CDRAG_RUNNING;
+            cdrag.startMs       = millis();
+            cdrag.prevLat       = gd.lat;
+            cdrag.prevLon       = gd.lon;
+            cdrag.distM         = 0;
+            cdrag.rolloutAccumM = 0;
+            cdrag.rolloutDone   = !cdrag.rolloutEnabled;  // skip if disabled
+            cdrag.peakG         = g;
+            cdrag.reactionTimeS = (cdrag.startMs - cdrag.armMs) / 1000.0f;
             screenDirty = true;
             buzz(3000, 80);
         }
@@ -1094,18 +1191,35 @@ void updateCDrag() {
 
     // ── RUNNING ──────────────────────────────────────────────────────────
     if (cdragState == CDRAG_RUNNING) {
-        float elapsed = (millis() - cdrag.startMs) / 1000.0f;
+        // Distance increment
         float dKm = haversine(cdrag.prevLat, cdrag.prevLon, gd.lat, gd.lon);
-        cdrag.distM   += dKm * 1000.0f;
-        cdrag.prevLat  = gd.lat;
-        cdrag.prevLon  = gd.lon;
+        float dM  = dKm * 1000.0f;
+        cdrag.prevLat = gd.lat;
+        cdrag.prevLon = gd.lon;
         if (g > cdrag.peakG) cdrag.peakG = g;
 
-        // Check each slot
+        // ── Rollout phase ─────────────────────────────────────────────
+        if (!cdrag.rolloutDone) {
+            cdrag.rolloutAccumM += dM;
+            if (cdrag.rolloutAccumM >= cdrag.rolloutM) {
+                // Rollout complete — reset timer & distance
+                cdrag.rolloutDone = true;
+                cdrag.startMs     = millis();
+                cdrag.distM       = 0;
+                screenDirty       = true;
+                buzz(2200, 40);   // short beep = timer started
+            }
+            return;   // don't count distance until rollout done
+        }
+
+        cdrag.distM += dM;
+        float elapsed = (millis() - cdrag.startMs) / 1000.0f;
+
+        // ── Check each slot ───────────────────────────────────────────
         bool allDone = true;
         for (int i = 0; i < CDRAG_SLOTS; i++) {
             CDragSlot &s = cdrag.slots[i];
-            if (s.distM == 0) continue;   // disabled slot
+            if (s.distM == 0) continue;   // slot disabled
             if (!s.set) {
                 allDone = false;
                 if (cdrag.distM >= (double)s.distM) {
@@ -1113,18 +1227,16 @@ void updateCDrag() {
                     s.speedKmh = spd;
                     s.set      = true;
                     screenDirty = true;
-                    buzz(2500, 60);  // beep each split
+                    buzz(2500, 60);
                 }
             }
         }
 
         // Find max enabled distance
         uint16_t maxDist = 0;
-        for (int i = 0; i < CDRAG_SLOTS; i++) {
+        for (int i = 0; i < CDRAG_SLOTS; i++)
             if (cdrag.slots[i].distM > maxDist) maxDist = cdrag.slots[i].distM;
-        }
 
-        // All set, or passed max distance
         if (allDone || (maxDist > 0 && cdrag.distM >= (double)maxDist + 5.0)) {
             cdragState  = CDRAG_DONE;
             screenDirty = true;
@@ -1133,174 +1245,284 @@ void updateCDrag() {
     }
 }
 
-// ─── CUSTOM DRAG SCREEN ──────────────────────────────────────────────────────
-void drawCDrag() {
+// ─── CUSTOM DRAG SETUP SCREEN ────────────────────────────────────────────────
+void drawCDragSetup() {
     tft.fillRect(0, 22, 240, 298, C_BG);
-    tft.setTextSize(1);
+    char buf[28];
 
     // Header
-    tft.fillRect(0, 22, 240, 18, 0x0018);   // dark blue header
+    tft.fillRect(0, 22, 240, 18, 0x0018);
+    tft.setTextColor(C_TRACK, 0x0018);
+    tft.setCursor(4, 27);
+    tft.print("CUSTOM DRAG  SETUP");
+
+    // ── Helper lambda-like inline for a setup row ─────────────────────────
+    // Row layout: [row#] [label 60px] [value 80px] [<U/D> if editing]
+    auto setupRow = [&](int row, const char* label, const char* valStr,
+                        uint16_t valColor, bool toggle = false) {
+        bool isCur  = (row == cdragCurRow);
+        bool isEdit = (isCur && cdragEditing && !toggle);
+        uint16_t bg  = isCur ? (isEdit ? 0x001F : 0x2104) : C_BG;
+        int ry = 44 + row * 26;
+
+        tft.fillRect(4, ry, 232, 22, bg);
+        tft.drawRect(4, ry, 232, 22, isCur ? C_TRACK : C_DGREY);
+
+        // Row label
+        tft.setTextColor(isCur ? C_WHITE : C_LGREY, bg);
+        tft.setTextSize(1);
+        tft.setCursor(8, ry + 7);
+        tft.print(label);
+
+        // Value
+        tft.setTextColor(isEdit ? C_YELLOW : valColor, bg);
+        tft.setTextSize(1);
+        tft.setCursor(110, ry + 7);
+        tft.print(valStr);
+
+        // Edit indicator
+        if (isEdit) {
+            tft.setTextColor(C_YELLOW, bg);
+            tft.setCursor(190, ry + 7);
+            tft.print("<U/D>");
+        } else if (isCur && !toggle) {
+            tft.setTextColor(C_DGREY, bg);
+            tft.setCursor(200, ry + 7);
+            tft.print("SEL");
+        } else if (isCur && toggle) {
+            tft.setTextColor(C_YELLOW, bg);
+            tft.setCursor(196, ry + 7);
+            tft.print("SEL");
+        }
+    };
+
+    // ── 5 Distance slots ──────────────────────────────────────────────────
+    for (int i = 0; i < CDRAG_SLOTS; i++) {
+        char label[10], val[12];
+        snprintf(label, sizeof(label), "DIST %d", i+1);
+        if (cdrag.slots[i].distM == 0)
+            snprintf(val, sizeof(val), "  OFF");
+        else
+            snprintf(val, sizeof(val), "%4d m", cdrag.slots[i].distM);
+        uint16_t vc = cdrag.slots[i].distM ? C_WHITE : C_DGREY;
+        setupRow(i, label, val, vc);
+    }
+
+    // ── Rollout ON/OFF ────────────────────────────────────────────────────
+    {
+        char val[14];
+        snprintf(val, sizeof(val), "%s", cdrag.rolloutEnabled ? " ON " : " OFF");
+        setupRow(5, "ROLLOUT", val,
+                 cdrag.rolloutEnabled ? C_ACCENT : C_DGREY, true);
+    }
+
+    // ── Rollout distance ─────────────────────────────────────────────────
+    {
+        char val[14];
+        snprintf(val, sizeof(val), "%.1f m", cdrag.rolloutM);
+        uint16_t vc = cdrag.rolloutEnabled ? C_WHITE : C_DGREY;
+        setupRow(6, "  ROLLOUT DIST", val, vc);
+    }
+
+    // ── Interval mode ON/OFF ─────────────────────────────────────────────
+    {
+        char val[14];
+        snprintf(val, sizeof(val), "%s", cdrag.intervalMode ? " ON " : " OFF");
+        setupRow(7, "INTERVAL MODE", val,
+                 cdrag.intervalMode ? C_YELLOW : C_DGREY, true);
+    }
+
+    // ── Interval spacing ─────────────────────────────────────────────────
+    {
+        char val[14];
+        snprintf(val, sizeof(val), "%d m", cdrag.intervalM);
+        uint16_t vc = cdrag.intervalMode ? C_WHITE : C_DGREY;
+        setupRow(8, "  INTERVAL", val, vc);
+    }
+
+    // ── [ARM] row ────────────────────────────────────────────────────────
+    {
+        bool isCur = (cdragCurRow == 9);
+        uint16_t bg = isCur ? 0x3800 : C_BG;
+        int ry = 44 + 9 * 26;
+        tft.fillRect(4, ry, 232, 22, bg);
+        tft.drawRect(4, ry, 232, 22, isCur ? C_YELLOW : C_DGREY);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(isCur ? C_YELLOW : C_DGREY, bg);
+        tft.setTextSize(1);
+        tft.drawString(">>> ARM & LAUNCH <<<", 120, ry + 11);
+        tft.setTextDatum(TL_DATUM);
+    }
+
+    // Hint at bottom
+    tft.setTextColor(C_DGREY, C_BG);
+    tft.setTextSize(1);
+    tft.setCursor(4, 308);
+    if (!cdragEditing)
+        tft.print("[U/D]Nav [SEL]Edit/Toggle [BCK]Home");
+    else
+        tft.print("[U/D]Change value  [SEL/BCK]Confirm");
+
+    drawStatusBar();
+}
+
+// ─── CUSTOM DRAG RUN/DONE SCREEN ─────────────────────────────────────────────
+void drawCDragRun() {
+    tft.fillRect(0, 22, 240, 298, C_BG);
+    char buf[28];
+
+    // Header
+    tft.fillRect(0, 22, 240, 18, 0x0018);
     tft.setTextColor(C_TRACK, 0x0018);
     tft.setCursor(4, 27);
     tft.print("CUSTOM DRAG");
-
-    const char* stateStr[] = {"SETUP","ARMED","RUNNING","DONE"};
-    uint16_t stateCol[]    = {C_TRACK, C_YELLOW, C_ACCENT, C_ORANGE};
+    const char* stateStr[] = {"SETUP","IDLE","ARMED","RUNNING","DONE"};
+    uint16_t    stateCol[] = {C_LGREY, C_LGREY, C_YELLOW, C_ACCENT, C_ORANGE};
     tft.setTextColor(stateCol[cdragState], 0x0018);
     tft.setCursor(160, 27);
     tft.print(stateStr[cdragState]);
 
-    // ── SETUP / DONE / RUNNING display ───────────────────────────────────
-    char buf[24];
-
-    // Big speed (always visible)
+    // ── Big speed ────────────────────────────────────────────────────────
     tft.setTextDatum(MC_DATUM);
     snprintf(buf, sizeof(buf), "%.0f", gd.speed_kmh);
-    tft.setTextSize(4);
+    tft.setTextSize(5);
     tft.setTextColor(cdragState == CDRAG_RUNNING ? C_ACCENT : C_DGREY, C_BG);
-    tft.drawString(buf, 185, 58);
+    tft.drawString(buf, 75, 65);
     tft.setTextSize(1);
     tft.setTextColor(C_DGREY, C_BG);
-    tft.drawString("km/h", 185, 76);
+    tft.drawString("km/h", 75, 88);
 
-    // Timer
+    // ── Timer ────────────────────────────────────────────────────────────
     tft.setTextSize(2);
     tft.setTextColor(C_WHITE, C_BG);
-    if (cdragState == CDRAG_RUNNING) {
-        float el = (millis() - cdrag.startMs) / 1000.0f;
-        snprintf(buf, sizeof(buf), "%.2f s", el);
+    if (cdragState == CDRAG_ARMED) {
+        tft.drawString("ARMED", 185, 55);
+        tft.setTextSize(1);
+        tft.setTextColor(C_YELLOW, C_BG);
+        tft.drawString("Launch!", 185, 74);
+    } else if (cdragState == CDRAG_RUNNING) {
+        // Show rollout phase label if active
+        if (!cdrag.rolloutDone) {
+            tft.setTextSize(1);
+            tft.setTextColor(C_ORANGE, C_BG);
+            tft.drawString("ROLLOUT", 185, 50);
+            snprintf(buf, sizeof(buf), "%.1fm", cdrag.rolloutAccumM);
+            tft.setTextColor(C_WHITE, C_BG);
+            tft.setTextSize(2);
+            tft.drawString(buf, 185, 65);
+        } else {
+            float el = (millis() - cdrag.startMs) / 1000.0f;
+            snprintf(buf, sizeof(buf), "%.2fs", el);
+            tft.drawString(buf, 185, 60);
+        }
     } else if (cdragState == CDRAG_DONE) {
-        // Show time to last set split
         float lastT = 0;
         for (int i = 0; i < CDRAG_SLOTS; i++)
             if (cdrag.slots[i].set && cdrag.slots[i].timeS > lastT)
                 lastT = cdrag.slots[i].timeS;
-        snprintf(buf, sizeof(buf), "%.2f s", lastT);
-    } else {
-        snprintf(buf, sizeof(buf), "--.-s");
+        snprintf(buf, sizeof(buf), "%.2fs", lastT);
+        tft.drawString(buf, 185, 60);
     }
-    tft.setTextDatum(TL_DATUM);
-    tft.setCursor(4, 44);
-    tft.setTextSize(2);
-    tft.setTextColor(C_WHITE, C_BG);
-    tft.print(buf);
 
-    // Distance progress bar
+    // ── Progress bar ─────────────────────────────────────────────────────
     uint16_t maxDist = 0;
     for (int i = 0; i < CDRAG_SLOTS; i++)
         if (cdrag.slots[i].distM > maxDist) maxDist = cdrag.slots[i].distM;
 
-    if (maxDist > 0 && (cdragState == CDRAG_RUNNING || cdragState == CDRAG_DONE)) {
-        int barY = 84;
-        tft.drawRect(4, barY, 230, 8, C_DGREY);
+    if (maxDist > 0) {
+        int barY = 96;
+        tft.drawRect(4, barY, 232, 9, C_DGREY);
         float pct = constrain((float)cdrag.distM / maxDist, 0.0f, 1.0f);
-        tft.fillRect(5, barY+1, (int)(228*pct), 6, C_TRACK);
-        // Markers for each slot
+        tft.fillRect(5, barY+1, (int)(230*pct), 7,
+                     cdrag.rolloutDone ? C_TRACK : C_ORANGE);
         for (int i = 0; i < CDRAG_SLOTS; i++) {
             if (cdrag.slots[i].distM == 0) continue;
-            int mx = 4 + (int)(230.0f * cdrag.slots[i].distM / maxDist);
-            tft.drawFastVLine(mx, barY-2, 12, C_YELLOW);
+            int mx = 4 + (int)(232.0f * cdrag.slots[i].distM / maxDist);
+            uint16_t mc = cdrag.slots[i].set ? C_ACCENT : C_YELLOW;
+            tft.drawFastVLine(mx, barY-3, 15, mc);
         }
         tft.setTextSize(1);
         tft.setTextColor(C_LGREY, C_BG);
-        tft.setCursor(4, 94);
+        tft.setTextDatum(TL_DATUM);
         snprintf(buf, sizeof(buf), "%.0f / %d m", cdrag.distM, maxDist);
-        tft.print(buf);
-    }
-
-    // ── 5 Slot rows ──────────────────────────────────────────────────────
-    tft.drawFastHLine(4, 104, 232, C_DGREY);
-
-    int ry = 108;
-    for (int i = 0; i < CDRAG_SLOTS; i++) {
-        CDragSlot &s = cdrag.slots[i];
-        bool isCursor = (cdragState == CDRAG_IDLE && i == cdragCurSlot);
-        bool isEdit   = (isCursor && cdragEditing);
-
-        // Row background highlight
-        if (isCursor) {
-            tft.fillRect(4, ry-1, 232, 13, isEdit ? 0x001F : 0x1082);
-        }
-
-        // Slot number
-        tft.setTextColor(isCursor ? C_WHITE : C_LGREY, isCursor ? (isEdit?0x001F:0x1082) : C_BG);
-        tft.setTextSize(1);
-        tft.setCursor(6, ry);
-        snprintf(buf, sizeof(buf), "S%d:", i+1);
+        tft.setCursor(4, 108);
         tft.print(buf);
 
-        // Distance target
-        tft.setCursor(24, ry);
-        if (s.distM == 0) {
-            tft.setTextColor(C_DGREY, isCursor?(isEdit?0x001F:0x1082):C_BG);
-            tft.print(" OFF ");
-        } else {
-            tft.setTextColor(isEdit ? C_YELLOW : (isCursor ? C_TRACK : C_WHITE),
-                             isCursor ? (isEdit?0x001F:0x1082) : C_BG);
-            snprintf(buf, sizeof(buf), "%4d m", s.distM);
+        // Rollout indicator
+        if (cdrag.rolloutEnabled) {
+            tft.setTextColor(cdrag.rolloutDone ? C_ACCENT : C_ORANGE, C_BG);
+            tft.setCursor(150, 108);
+            snprintf(buf, sizeof(buf), "RO:%.1fm %s",
+                     cdrag.rolloutM, cdrag.rolloutDone ? "OK" : "...");
             tft.print(buf);
         }
+    }
 
-        // Result
+    // ── Slot result rows ─────────────────────────────────────────────────
+    tft.drawFastHLine(4, 120, 232, C_DGREY);
+    int ry = 124;
+    for (int i = 0; i < CDRAG_SLOTS; i++) {
+        CDragSlot &s = cdrag.slots[i];
+        if (s.distM == 0) continue;
+
+        // Highlight row if just set
+        tft.setTextSize(1);
+        tft.setTextColor(C_LGREY, C_BG);
+        tft.setCursor(6, ry);
+        snprintf(buf, sizeof(buf), "%dm", s.distM);
+        tft.print(buf);
+
         if (s.set) {
             tft.setTextColor(C_ACCENT, C_BG);
-            tft.setCursor(80, ry);
-            snprintf(buf, sizeof(buf), "%.3fs", s.timeS);
+            tft.setCursor(60, ry);
+            snprintf(buf, sizeof(buf), "%.3f s", s.timeS);
             tft.print(buf);
             tft.setTextColor(C_WHITE, C_BG);
             tft.setCursor(142, ry);
-            snprintf(buf, sizeof(buf), "%.0fkm/h", s.speedKmh);
+            snprintf(buf, sizeof(buf), "%.0f km/h", s.speedKmh);
             tft.print(buf);
-        } else if (cdragState == CDRAG_RUNNING) {
+        } else {
             tft.setTextColor(C_DGREY, C_BG);
-            tft.setCursor(80, ry);
+            tft.setCursor(60, ry);
             tft.print("---");
         }
-
-        // Edit arrow indicator
-        if (isEdit) {
-            tft.setTextColor(C_YELLOW, 0x001F);
-            tft.setCursor(55, ry);
-            tft.print("<U/D>");
-        }
-
         ry += 14;
     }
 
-    tft.drawFastHLine(4, ry, 232, C_DGREY); ry += 4;
-
-    // Reaction + Peak G
+    // ── Stats footer ──────────────────────────────────────────────────────
+    tft.drawFastHLine(4, ry+2, 232, C_DGREY); ry += 6;
     if (cdragState == CDRAG_DONE || cdragState == CDRAG_RUNNING) {
         tft.setTextColor(C_LGREY, C_BG); tft.setCursor(6, ry);
         tft.print("React:");
         tft.setTextColor(C_PURPLE, C_BG); tft.setCursor(50, ry);
         snprintf(buf, sizeof(buf), "%.3fs", cdrag.reactionTimeS);
         tft.print(buf);
-
-        tft.setTextColor(C_LGREY, C_BG); tft.setCursor(120, ry);
+        tft.setTextColor(C_LGREY, C_BG); tft.setCursor(118, ry);
         tft.print("PkG:");
         tft.setTextColor(cdrag.peakG > 1.2f ? C_ORANGE : C_WHITE, C_BG);
         tft.setCursor(148, ry);
         snprintf(buf, sizeof(buf), "%.2fG", cdrag.peakG);
         tft.print(buf);
-        ry += 12;
     }
 
     // Hint
     tft.setTextColor(C_DGREY, C_BG);
-    tft.setCursor(4, 304);
-    if (cdragState == CDRAG_IDLE) {
-        if (!cdragEditing)
-            tft.print("[U/D]Slot [SEL]Edit>[ARM]");
-        else
-            tft.print("[U/D]Val  [SEL]Next/ARM [BCK]Cancel");
-    } else if (cdragState == CDRAG_DONE) {
-        tft.print("[SEL/BCK] Reset & Edit");
-    } else {
+    tft.setCursor(4, 308);
+    if (cdragState == CDRAG_DONE)
+        tft.print("[SEL/BCK] Back to Setup");
+    else
         tft.print("[SEL/BCK] Abort");
-    }
 
     drawStatusBar();
+}
+
+// ─── CUSTOM DRAG DISPATCHER ──────────────────────────────────────────────────
+void drawCDrag() {
+    if (cdragState == CDRAG_SETUP) {
+        drawCDragSetup();
+    } else {
+        drawCDragRun();
+    }
 }
 
 // ─── DRAG RACE LOGIC ─────────────────────────────────────────────────────────
