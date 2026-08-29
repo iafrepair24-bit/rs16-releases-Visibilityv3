@@ -60,6 +60,11 @@
 #define C_LGREY    0xC618
 #define C_DGREY    0x4208
 #define C_TRACK    0x07FF           // cyan
+#define C_YELLOW   0xFFE0
+#define C_PURPLE   0xF81F
+#define C_ORANGE   0xFD20
+#define C_SKY      0x867F           // artificial horizon sky
+#define C_GROUND   0x5220           // artificial horizon ground
 
 // ─── OBJECTS ─────────────────────────────────────────────────────────────────
 TFT_eSPI     tft;
@@ -68,7 +73,7 @@ Adafruit_MPU6050 mpu;
 HardwareSerial gpsSerial(2);
 
 // ─── SCREEN PAGES ────────────────────────────────────────────────────────────
-enum Screen { SCR_HOME, SCR_TRACK, SCR_STATS, SCR_FILES, SCR_COUNT };
+enum Screen { SCR_HOME, SCR_TRACK, SCR_STATS, SCR_GRAPH, SCR_FILES, SCR_COUNT };
 Screen currentScreen = SCR_HOME;
 
 // ─── BUTTON STATE ────────────────────────────────────────────────────────────
@@ -140,6 +145,26 @@ uint32_t lastImuMs = 0;
 uint32_t lastRedrawMs = 0;
 bool screenDirty = true;
 
+// ─── GRAPH RING BUFFERS (200 samples each) ───────────────────────────────────
+#define GBUF_LEN  200
+struct GraphBuf {
+    float  data[GBUF_LEN];
+    uint16_t head = 0;
+    float  vmin = 0, vmax = 1;   // auto-scale range
+    void push(float v) {
+        data[head] = v;
+        head = (head + 1) % GBUF_LEN;
+        // expand range, slow decay back toward 0
+        if (v > vmax) vmax = v;
+        if (v < vmin) vmin = v;
+    }
+    float get(uint16_t i) const {  // i=0 oldest, i=GBUF_LEN-1 newest
+        return data[(head + i) % GBUF_LEN];
+    }
+};
+GraphBuf gbSpeed, gbGforce, gbPitch, gbRoll;
+uint32_t lastGraphMs = 0;          // sample rate ~50 ms
+
 // ─── FORWARD DECLARATIONS ────────────────────────────────────────────────────
 void readButtons();
 void processGps();
@@ -153,9 +178,13 @@ void drawScreen();
 void drawHome();
 void drawTrack();
 void drawStats();
+void drawGraph();
 void drawFiles();
 void drawStatusBar();
 void drawSatBar();
+void drawMiniGraph(int x, int y, int w, int h, GraphBuf &gb, uint16_t col,
+                   const char* label, const char* unit, float curVal);
+void drawArtificialHorizon(int cx, int cy, int r, float pitch, float roll);
 void buzz(uint16_t freq, uint16_t ms);
 float haversine(double lat1, double lon1, double lat2, double lon2);
 void playStartupJingle();
@@ -249,6 +278,15 @@ void loop() {
     if (now - lastImuMs >= 20) {
         readImu();
         lastImuMs = now;
+    }
+
+    // Graph sample @ 50 ms
+    if (now - lastGraphMs >= 50) {
+        gbSpeed.push(gd.speed_kmh);
+        gbGforce.push(imuData.accel_g);
+        gbPitch.push(imuData.pitch);
+        gbRoll.push(imuData.roll);
+        lastGraphMs = now;
     }
 
     // Battery @ 1 Hz
