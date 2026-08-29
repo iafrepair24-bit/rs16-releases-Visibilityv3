@@ -73,7 +73,7 @@ Adafruit_MPU6050 mpu;
 HardwareSerial gpsSerial(2);
 
 // ─── SCREEN PAGES ────────────────────────────────────────────────────────────
-enum Screen { SCR_HOME, SCR_TRACK, SCR_STATS, SCR_GRAPH, SCR_FILES, SCR_COUNT };
+enum Screen { SCR_HOME, SCR_TRACK, SCR_STATS, SCR_GRAPH, SCR_DRAG, SCR_FILES, SCR_COUNT };
 Screen currentScreen = SCR_HOME;
 
 // ─── BUTTON STATE ────────────────────────────────────────────────────────────
@@ -165,6 +165,53 @@ struct GraphBuf {
 GraphBuf gbSpeed, gbGforce, gbPitch, gbRoll;
 uint32_t lastGraphMs = 0;          // sample rate ~50 ms
 
+// ─── DRAG RACE STATE MACHINE ─────────────────────────────────────────────────
+enum DragState {
+    DRAG_IDLE,    // waiting for arm
+    DRAG_ARMED,   // armed, waiting for launch (G-force or speed threshold)
+    DRAG_RUNNING, // timer running
+    DRAG_DONE     // results ready
+};
+DragState dragState = DRAG_IDLE;
+
+// Distance milestones (metres)
+#define DRAG_60FT_M      18.288f   // 60 feet
+#define DRAG_8TH_M      201.168f   // 1/8 mile
+#define DRAG_QTR_M      402.336f   // 1/4 mile
+#define DRAG_LAUNCH_G     0.25f    // G-force threshold to detect launch
+#define DRAG_LAUNCH_KMH   5.0f     // fallback: speed threshold for launch
+
+struct DragSplit {
+    float timeS   = 0;
+    float speedKmh= 0;
+    bool  set     = false;
+};
+
+struct DragResult {
+    DragSplit s0_60;    // 0-60 km/h
+    DragSplit s0_80;    // 0-80 km/h
+    DragSplit s0_100;   // 0-100 km/h
+    DragSplit s0_150;   // 0-150 km/h
+    DragSplit s0_200;   // 0-200 km/h
+    DragSplit s0_250;   // 0-250 km/h
+    DragSplit s60ft;    // 60 ft
+    DragSplit s8th;     // 1/8 mile  (time + trap speed at line)
+    DragSplit sqtr;     // 1/4 mile  (time + trap speed at line)
+    float reactionTimeS = 0;   // G-force spike to actual launch
+    float peakG         = 0;
+    uint32_t startMs    = 0;
+    double   startLat   = 0, startLon = 0;
+    double   distM      = 0;   // cumulative metres this run
+    double   prevLat    = 0,   prevLon = 0;
+    bool     hasStart   = false;
+};
+DragResult drag;
+
+// Pre-launch G spike detection (reaction time)
+float  dragPreG       = 0;
+bool   dragLaunchSeen = false;
+uint32_t dragArmMs    = 0;
+
 // ─── FORWARD DECLARATIONS ────────────────────────────────────────────────────
 void readButtons();
 void processGps();
@@ -174,11 +221,15 @@ void updateStats();
 void startRecording();
 void stopRecording();
 void writeLog();
+void updateDrag();
+void armDrag();
+void resetDrag();
 void drawScreen();
 void drawHome();
 void drawTrack();
 void drawStats();
 void drawGraph();
+void drawDrag();
 void drawFiles();
 void drawStatusBar();
 void drawSatBar();
@@ -300,6 +351,11 @@ void loop() {
         updateStats();
     }
 
+    // Drag race update (always active when on drag screen)
+    if (dragState == DRAG_ARMED || dragState == DRAG_RUNNING) {
+        updateDrag();
+    }
+
     // Write log @ LOG_INTERVAL_MS
     if (recording && gd.valid && (now - lastLogMs >= LOG_INTERVAL_MS)) {
         writeLog();
@@ -332,10 +388,13 @@ void loop() {
     }
     if (btnSelect) {
         if (currentScreen == SCR_HOME || currentScreen == SCR_TRACK) {
-            if (!recording) {
-                startRecording();
-            } else {
-                stopRecording();
+            if (!recording) startRecording();
+            else            stopRecording();
+        } else if (currentScreen == SCR_DRAG) {
+            if (dragState == DRAG_IDLE || dragState == DRAG_DONE) {
+                armDrag();
+            } else if (dragState == DRAG_ARMED || dragState == DRAG_RUNNING) {
+                resetDrag();
             }
         }
     }
@@ -855,12 +914,259 @@ void drawFiles() {
     drawStatusBar();
 }
 
+// ─── DRAG RACE LOGIC ─────────────────────────────────────────────────────────
+
+void resetDrag() {
+    dragState = DRAG_IDLE;
+    drag = DragResult{};
+    dragPreG = 0;
+    dragLaunchSeen = false;
+    screenDirty = true;
+}
+
+void armDrag() {
+    resetDrag();
+    dragState   = DRAG_ARMED;
+    dragArmMs   = millis();
+    dragPreG    = imuData.accel_g;
+    screenDirty = true;
+    // Three short beeps to signal armed
+    buzz(2000,60); delay(60); buzz(2000,60); delay(60); buzz(2000,60);
+}
+
+// Helper: check & record a speed split
+static void checkSpeedSplit(DragSplit &sp, float target, float spd, float t) {
+    if (!sp.set && spd >= target) {
+        sp.timeS    = t;
+        sp.speedKmh = spd;
+        sp.set      = true;
+    }
+}
+
+// Helper: check & record a distance split
+static void checkDistSplit(DragSplit &sp, float targetM, float distM, float spd, float t) {
+    if (!sp.set && distM >= targetM) {
+        sp.timeS    = t;
+        sp.speedKmh = spd;
+        sp.set      = true;
+    }
+}
+
+void updateDrag() {
+    if (!gd.valid) return;
+
+    float spd = gd.speed_kmh;
+    float g   = imuData.accel_g;
+
+    // ── ARMED: detect launch ──────────────────────────────────────────────
+    if (dragState == DRAG_ARMED) {
+        // Track peak G while stationary (pre-launch rev)
+        if (spd < DRAG_LAUNCH_KMH && g > dragPreG) dragPreG = g;
+
+        // Launch detected: significant G spike OR speed crosses threshold
+        bool gLaunch   = (g > dragPreG + DRAG_LAUNCH_G) && (g > 0.4f);
+        bool spdLaunch = (spd >= DRAG_LAUNCH_KMH);
+
+        if (gLaunch || spdLaunch) {
+            dragState       = DRAG_RUNNING;
+            drag.startMs    = millis();
+            drag.startLat   = gd.lat;
+            drag.startLon   = gd.lon;
+            drag.prevLat    = gd.lat;
+            drag.prevLon    = gd.lon;
+            drag.hasStart   = true;
+            drag.distM      = 0;
+            drag.peakG      = g;
+            // Reaction time = time from arm to launch
+            drag.reactionTimeS = (drag.startMs - dragArmMs) / 1000.0f;
+            screenDirty = true;
+            buzz(3000, 80);   // launch beep
+        }
+        return;
+    }
+
+    // ── RUNNING ──────────────────────────────────────────────────────────
+    if (dragState == DRAG_RUNNING) {
+        float elapsed = (millis() - drag.startMs) / 1000.0f;
+
+        // Accumulate distance
+        float dKm = haversine(drag.prevLat, drag.prevLon, gd.lat, gd.lon);
+        drag.distM   += dKm * 1000.0f;
+        drag.prevLat  = gd.lat;
+        drag.prevLon  = gd.lon;
+
+        if (g > drag.peakG) drag.peakG = g;
+
+        // Speed splits
+        checkSpeedSplit(drag.s0_60,  60.0f,  spd, elapsed);
+        checkSpeedSplit(drag.s0_80,  80.0f,  spd, elapsed);
+        checkSpeedSplit(drag.s0_100, 100.0f, spd, elapsed);
+        checkSpeedSplit(drag.s0_150, 150.0f, spd, elapsed);
+        checkSpeedSplit(drag.s0_200, 200.0f, spd, elapsed);
+        checkSpeedSplit(drag.s0_250, 250.0f, spd, elapsed);
+
+        // Distance splits
+        checkDistSplit(drag.s60ft, DRAG_60FT_M, drag.distM, spd, elapsed);
+        checkDistSplit(drag.s8th,  DRAG_8TH_M,  drag.distM, spd, elapsed);
+        checkDistSplit(drag.sqtr,  DRAG_QTR_M,  drag.distM, spd, elapsed);
+
+        // Finish when 1/4 mile done
+        if (drag.sqtr.set) {
+            dragState   = DRAG_DONE;
+            screenDirty = true;
+            // Victory jingle
+            buzz(2000,80); delay(60); buzz(2500,80); delay(60); buzz(3000,150);
+        }
+    }
+}
+
+// ─── DRAG SCREEN DRAW ────────────────────────────────────────────────────────
+void drawDrag() {
+    tft.fillRect(0, 22, 240, 298, C_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(1);
+
+    // ── Header bar ───────────────────────────────────────────────────────
+    tft.fillRect(0, 22, 240, 18, 0x3800);   // dark red header
+    tft.setTextColor(C_YELLOW, 0x3800);
+    tft.setTextSize(1);
+    tft.setCursor(4, 27);
+    tft.print("DRAG RACE");
+
+    // State label top-right
+    const char* stateStr[] = {"IDLE","ARMED","RUNNING","DONE"};
+    uint16_t stateCol[] = {C_DGREY, C_YELLOW, C_ACCENT, C_ORANGE};
+    tft.setTextColor(stateCol[dragState], 0x3800);
+    tft.setCursor(160, 27);
+    tft.print(stateStr[dragState]);
+
+    // ── Big current speed ────────────────────────────────────────────────
+    tft.setTextDatum(MC_DATUM);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.0f", gd.speed_kmh);
+    tft.setTextSize(5);
+    tft.setTextColor(
+        (dragState == DRAG_RUNNING) ? C_ACCENT :
+        (dragState == DRAG_DONE)    ? C_YELLOW : C_LGREY,
+        C_BG);
+    tft.drawString(buf, 80, 68);
+    tft.setTextSize(1);
+    tft.setTextColor(C_DGREY, C_BG);
+    tft.drawString("km/h", 80, 93);
+
+    // Live elapsed timer (top-right area)
+    tft.setTextSize(2);
+    tft.setTextColor(C_WHITE, C_BG);
+    if (dragState == DRAG_RUNNING) {
+        float elapsed = (millis() - drag.startMs) / 1000.0f;
+        snprintf(buf, sizeof(buf), "%.2f s", elapsed);
+    } else if (dragState == DRAG_DONE && drag.sqtr.set) {
+        snprintf(buf, sizeof(buf), "%.2f s", drag.sqtr.timeS);
+    } else {
+        snprintf(buf, sizeof(buf), "--.-s");
+    }
+    tft.drawString(buf, 185, 62);
+    tft.setTextSize(1);
+    tft.setTextColor(C_DGREY, C_BG);
+    tft.drawString("ELAPSED", 185, 80);
+
+    // Dist bar (progress to 1/4 mile)
+    int barY = 102;
+    tft.drawRect(10, barY, 220, 10, C_DGREY);
+    float pct = constrain(drag.distM / DRAG_QTR_M, 0.0f, 1.0f);
+    if (pct > 0) tft.fillRect(11, barY+1, (int)(218*pct), 8, C_ACCENT);
+    // milestones
+    int x60ft = 10 + (int)(220 * DRAG_60FT_M / DRAG_QTR_M);
+    int x8th  = 10 + (int)(220 * DRAG_8TH_M  / DRAG_QTR_M);
+    tft.drawFastVLine(x60ft, barY-3, 16, C_YELLOW);
+    tft.drawFastVLine(x8th,  barY-3, 16, C_ORANGE);
+    tft.setTextColor(C_YELLOW, C_BG);
+    tft.setCursor(x60ft-8, barY+13); tft.print("60ft");
+    tft.setTextColor(C_ORANGE, C_BG);
+    tft.setCursor(x8th-8,  barY+13); tft.print("1/8");
+
+    // ── Results table ────────────────────────────────────────────────────
+    tft.drawFastHLine(8, 128, 224, C_DGREY);
+
+    auto splitRow = [&](int y, const char* label, DragSplit &sp) {
+        tft.setTextColor(C_LGREY, C_BG);
+        tft.setCursor(10, y);
+        tft.print(label);
+        if (sp.set) {
+            tft.setTextColor(C_ACCENT, C_BG);
+            tft.setCursor(100, y);
+            snprintf(buf, sizeof(buf), "%.3f s", sp.timeS);
+            tft.print(buf);
+            tft.setTextColor(C_WHITE, C_BG);
+            tft.setCursor(170, y);
+            snprintf(buf, sizeof(buf), "%.0f km/h", sp.speedKmh);
+            tft.print(buf);
+        } else {
+            tft.setTextColor(C_DGREY, C_BG);
+            tft.setCursor(100, y);
+            tft.print("---.--- s");
+        }
+    };
+
+    int ry = 133;
+    splitRow(ry,      "0-60  km/h",  drag.s0_60);  ry += 12;
+    splitRow(ry,      "0-80  km/h",  drag.s0_80);  ry += 12;
+    splitRow(ry,      "0-100 km/h",  drag.s0_100); ry += 12;
+    splitRow(ry,      "0-150 km/h",  drag.s0_150); ry += 12;
+    splitRow(ry,      "0-200 km/h",  drag.s0_200); ry += 12;
+    splitRow(ry,      "0-250 km/h",  drag.s0_250); ry += 12;
+
+    tft.drawFastHLine(8, ry, 224, C_DGREY); ry += 4;
+    tft.setTextColor(C_YELLOW, C_BG); tft.setCursor(10, ry);
+    tft.print("─ Distance splits ─");                ry += 12;
+    splitRow(ry,      "60 ft",        drag.s60ft); ry += 12;
+    splitRow(ry,      "1/8 mile",     drag.s8th);  ry += 12;
+    splitRow(ry,      "1/4 mile",     drag.sqtr);  ry += 12;
+
+    tft.drawFastHLine(8, ry, 224, C_DGREY); ry += 4;
+
+    // Reaction time
+    tft.setTextColor(C_LGREY, C_BG); tft.setCursor(10, ry);
+    tft.print("Reaction:");
+    if (drag.reactionTimeS > 0) {
+        tft.setTextColor(C_PURPLE, C_BG);
+        tft.setCursor(100, ry);
+        snprintf(buf, sizeof(buf), "%.3f s", drag.reactionTimeS);
+        tft.print(buf);
+    } else {
+        tft.setTextColor(C_DGREY, C_BG);
+        tft.setCursor(100, ry); tft.print("---");
+    }
+    ry += 12;
+
+    // Peak G
+    tft.setTextColor(C_LGREY, C_BG); tft.setCursor(10, ry);
+    tft.print("Peak G:");
+    tft.setTextColor(drag.peakG > 1.2f ? C_ORANGE : C_WHITE, C_BG);
+    tft.setCursor(100, ry);
+    snprintf(buf, sizeof(buf), "%.2f G", drag.peakG);
+    tft.print(buf);
+
+    // Bottom hint
+    tft.setTextColor(C_DGREY, C_BG);
+    tft.setCursor(8, 302);
+    if (dragState == DRAG_IDLE || dragState == DRAG_DONE) {
+        tft.print("[SELECT] ARM    [BACK] Home");
+    } else {
+        tft.print("[SELECT] ABORT/RESET");
+    }
+
+    drawStatusBar();
+}
+
 // ─── MAIN DRAW DISPATCHER ────────────────────────────────────────────────────
 void drawScreen() {
     switch (currentScreen) {
         case SCR_HOME:  drawHome();  break;
         case SCR_TRACK: drawTrack(); break;
         case SCR_STATS: drawStats(); break;
+        case SCR_GRAPH: drawGraph(); break;
+        case SCR_DRAG:  drawDrag();  break;
         case SCR_FILES: drawFiles(); break;
         default: break;
     }
